@@ -1,168 +1,203 @@
+/*
+ * Escaneo RÁPIDO: la lista de códigos se descarga al dispositivo y cada QR se valida
+ * al instante. El Sheet se actualiza en segundo plano (cola con reintentos).
+ */
 (() => {
   const CFG = window.APP_CONFIG;
   const $ = id => document.getElementById(id);
   const DEVICE = (navigator.userAgent.match(/\(([^;)]+)/) || [, 'web'])[1];
+  const PRESENTE = 'PRESENTE', SALIO = 'SALIÓ';
 
   let pin = localStorage.getItem('grad_pin') || '';
-  let scanner = null;
-  let camaras = [];
-  let camIdx = 0;
+  let modo = localStorage.getItem('grad_modo') || 'in';
+  let estados = new Map(JSON.parse(localStorage.getItem('grad_estados') || '[]'));
+  let cola = JSON.parse(localStorage.getItem('grad_cola') || '[]');
+  let cambiosLocales = 0;      // para no pisar escaneos nuevos con una sincronización vieja
+  let enviando = false;
   let ocupado = false;
   let ultimo = { code: '', t: 0 };
+  let scanner = null;
 
-  $('evento').textContent = CFG.EVENTO || '';
+  /* ============ Utilidades ============ */
+  const guardar = () => {
+    localStorage.setItem('grad_estados', JSON.stringify([...estados]));
+    localStorage.setItem('grad_cola', JSON.stringify(cola));
+  };
 
-  /* ================= API ================= */
   async function api(params) {
-    const url = CFG.API_URL + '?' + new URLSearchParams({ ...params, pin }).toString();
-    const res = await fetch(url, { method: 'GET', redirect: 'follow' });
+    const url = CFG.API_URL + '?' + new URLSearchParams({ ...params, pin });
+    const res = await fetch(url);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     return res.json();
   }
 
-  function setConexion(ok) {
-    $('conexion').className = 'punto ' + (ok ? 'ok' : 'err');
+  function pintarBarra() {
+    let p = 0;
+    estados.forEach(e => { if (e === PRESENTE) p++; });
+    $('total').textContent = estados.size;
+    $('presentes').textContent = p;
   }
 
-  function pintarStats(s) {
-    if (!s) return;
-    $('presentes').textContent = s.presentes;
-    $('total').textContent = s.total;
-    $('salieron').textContent = s.salieron;
-    $('pendientes').textContent = s.pendientes;
-    $('barraProgreso').style.width = (s.total ? (s.presentes / s.total) * 100 : 0) + '%';
+  function pintarSync(error) {
+    $('sync').className = 'punto' + (error ? ' err' : cola.length ? ' pend' : '');
   }
 
-  async function refrescarStats() {
-    try {
-      const r = await api({ action: 'stats' });
-      if (!r.ok) {
-        if (r.error === 'PIN incorrecto') return cerrarSesion('PIN incorrecto');
-        throw new Error(r.error);
-      }
-      pintarStats(r.stats);
-      setConexion(true);
-    } catch (e) {
-      setConexion(false);
-    }
+  /* ============ Validación local instantánea ============ */
+  function validar(code) {
+    if (!estados.has(code)) return 'INVALIDO';
+    const e = estados.get(code);
+    if (modo === 'in') return e === PRESENTE ? 'DUPLICADO' : 'ENTRADA';
+    return e === PRESENTE ? 'SALIDA' : 'NO_INGRESADO';
   }
 
-  /* ================= ESCANEO ================= */
-  async function procesar(codigoRaw) {
-    const code = String(codigoRaw || '').trim().toUpperCase();
+  const VISTA = {
+    ENTRADA:      { cls: 'ok-in',  icono: '✅', titulo: 'INGRESO OK' },
+    SALIDA:       { cls: 'ok-out', icono: '🚪', titulo: 'SALIDA OK' },
+    DUPLICADO:    { cls: 'mal',    icono: '⛔', titulo: 'YA INGRESÓ' },
+    NO_INGRESADO: { cls: 'mal',    icono: '⛔', titulo: 'NO HA INGRESADO' },
+    INVALIDO:     { cls: 'mal',    icono: '⛔', titulo: 'NO VÁLIDO' }
+  };
+
+  function alEscanear(texto) {
+    const code = String(texto || '').trim().toUpperCase();
     if (!code || ocupado) return;
-    // evita lecturas repetidas del mismo QR mientras sigue frente a la cámara
-    if (code === ultimo.code && Date.now() - ultimo.t < 4000) return;
+    // El mismo QR sigue frente a la cámara: ignorarlo unos segundos
+    if (code === ultimo.code && Date.now() - ultimo.t < 3000) return;
     ultimo = { code, t: Date.now() };
     ocupado = true;
-    pausar();
 
-    let r;
-    try {
-      r = await api({ action: 'scan', code, device: DEVICE });
-      setConexion(true);
-    } catch (e) {
-      setConexion(false);
-      r = { ok: false, resultado: 'ERROR', codigo: code, mensaje: 'Sin conexión. Intenta de nuevo.' };
-    }
-    if (r.error === 'PIN incorrecto') { ocupado = false; return cerrarSesion('PIN incorrecto'); }
+    const resultado = validar(code);
+    if (resultado === 'ENTRADA') estados.set(code, PRESENTE);
+    if (resultado === 'SALIDA') estados.set(code, SALIO);
+    cambiosLocales++;
 
-    pintarStats(r.stats);
-    mostrarResultado(r);
-    agregarHistorial(r);
+    // Todo intento va al servidor (los inválidos/duplicados quedan en "Registro")
+    cola.push({ code, modo, local: resultado });
+    guardar();
+    pintarBarra();
+    mostrar(resultado, code);
+    enviarCola();
 
+    const ok = resultado === 'ENTRADA' || resultado === 'SALIDA';
     setTimeout(() => {
       $('overlay').className = 'overlay oculto';
       ocupado = false;
-      reanudar();
-    }, r.resultado === 'INVALIDO' || r.resultado === 'ERROR' ? 2500 : 1700);
+      ultimo.t = Date.now();
+    }, ok ? 800 : 1800);
   }
 
-  const TEXTOS = {
-    ENTRADA:   { icono: '✅', titulo: 'PRESENTE' },
-    REINGRESO: { icono: '🔁', titulo: 'REINGRESO' },
-    SALIDA:    { icono: '🚪', titulo: 'SALIÓ' },
-    REPETIDO:  { icono: '⚠️', titulo: 'YA ESCANEADO' },
-    INVALIDO:  { icono: '⛔', titulo: 'NO VÁLIDO' },
-    ERROR:     { icono: '📡', titulo: 'ERROR' }
-  };
-
-  function mostrarResultado(r) {
-    const tipo = r.resultado || 'ERROR';
-    const t = TEXTOS[tipo] || TEXTOS.ERROR;
-    $('ovIcono').textContent = t.icono;
-    $('ovTitulo').textContent = t.titulo;
-    $('ovNombre').textContent = r.nombre || r.mensaje || '';
-    $('ovCodigo').textContent = r.codigo || '';
-    $('overlay').className = 'overlay ' + tipo;
-    feedback(tipo);
+  function mostrar(resultado, code) {
+    const v = VISTA[resultado];
+    $('ovIcono').textContent = v.icono;
+    $('ovTitulo').textContent = v.titulo;
+    $('ovCodigo').textContent = code;
+    $('overlay').className = 'overlay ' + v.cls;
+    if (v.cls === 'mal') { beep(220, .45); navigator.vibrate?.([300, 100, 300]); }
+    else { beep(v.cls === 'ok-in' ? 1000 : 650, .12); navigator.vibrate?.(80); }
   }
 
-  function agregarHistorial(r) {
-    const li = document.createElement('li');
-    const tipo = r.resultado || 'ERROR';
-    li.className = tipo;
-    const hora = new Date().toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    const izq = document.createElement('span');
-    izq.textContent = (TEXTOS[tipo] || TEXTOS.ERROR).titulo + ' · ' + (r.nombre || r.codigo || '');
-    const der = document.createElement('small');
-    der.textContent = hora;
-    li.append(izq, der);
-    const ul = $('historial');
-    ul.prepend(li);
-    while (ul.children.length > 15) ul.lastChild.remove();
-  }
-
-  /* Sonido + vibración */
   let audioCtx;
   function beep(freq, dur) {
     try {
       audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
       const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-      o.frequency.value = freq; o.connect(g); g.connect(audioCtx.destination);
-      g.gain.value = 0.2; o.start(); o.stop(audioCtx.currentTime + dur);
+      o.frequency.value = freq; g.gain.value = 0.25;
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(); o.stop(audioCtx.currentTime + dur);
     } catch (_) {}
   }
-  function feedback(tipo) {
-    if (tipo === 'ENTRADA' || tipo === 'REINGRESO') { beep(880, .15); navigator.vibrate?.(100); }
-    else if (tipo === 'SALIDA') { beep(600, .15); setTimeout(() => beep(600, .15), 180); navigator.vibrate?.([80, 60, 80]); }
-    else { beep(200, .5); navigator.vibrate?.([300, 100, 300]); }
+
+  /* ============ Cola hacia Google Sheets (segundo plano) ============ */
+  async function enviarCola() {
+    if (enviando || !cola.length) return pintarSync();
+    enviando = true;
+    pintarSync();
+    try {
+      while (cola.length) {
+        const item = cola[0];
+        const r = await api({ action: 'scan', code: item.code, modo: item.modo, device: DEVICE });
+        if (r.error === 'PIN incorrecto') { enviando = false; return cerrarSesion('PIN incorrecto'); }
+        const aceptadoLocal = item.local === 'ENTRADA' || item.local === 'SALIDA';
+        // Otro dispositivo registró este código antes → el servidor manda
+        if (aceptadoLocal && !r.ok) {
+          if (r.estado) estados.set(item.code, String(r.estado).toUpperCase());
+          avisar('⚠️ ' + item.code + (r.resultado === 'DUPLICADO'
+            ? ' ya había INGRESADO por otro dispositivo (posible copia)'
+            : ' rechazado: ' + r.resultado));
+          pintarBarra();
+        }
+        cola.shift();
+        guardar();
+      }
+      pintarSync();
+    } catch (e) {
+      pintarSync(true);
+      setTimeout(enviarCola, 3000);      // sin internet: reintenta solo
+    } finally {
+      enviando = false;
+    }
   }
 
-  /* ================= CÁMARA ================= */
+  function avisar(msg) {
+    $('aviso').textContent = msg;
+    $('aviso').classList.remove('oculto');
+    beep(220, .6); navigator.vibrate?.([400, 100, 400]);
+    clearTimeout(avisar.t);
+    avisar.t = setTimeout(() => $('aviso').classList.add('oculto'), 6000);
+  }
+
+  /* ============ Sincronizar con otros dispositivos ============ */
+  async function sincronizar() {
+    if (!pin || cola.length || enviando) return;
+    const marca = cambiosLocales;
+    try {
+      const r = await api({ action: 'all' });
+      if (r.error === 'PIN incorrecto') return cerrarSesion('PIN incorrecto');
+      if (!r.ok) throw new Error(r.error);
+      if (marca !== cambiosLocales || cola.length) return;   // hubo escaneos mientras tanto
+      estados = new Map(r.codigos);
+      guardar();
+      pintarBarra();
+      pintarSync();
+    } catch (_) { pintarSync(true); }
+  }
+
+  /* ============ Cámara ============ */
   async function iniciarCamara() {
     $('btnCamara').classList.add('oculto');
     try {
-      scanner = scanner || new Html5Qrcode('lector', { verbose: false });
-      if (!camaras.length) {
-        camaras = await Html5Qrcode.getCameras();
-        const trasera = camaras.findIndex(c => /back|rear|trasera|environment/i.test(c.label));
-        camIdx = trasera >= 0 ? trasera : camaras.length - 1;
+      if (!scanner) {
+        scanner = new Html5Qrcode('lector', {
+          verbose: false,
+          formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE],      // solo QR = más rápido
+          experimentalFeatures: { useBarCodeDetectorIfSupported: true } // lector nativo del teléfono
+        });
       }
-      const fuente = camaras[camIdx] ? camaras[camIdx].id : { facingMode: 'environment' };
       await scanner.start(
-        fuente,
-        { fps: 10, qrbox: (w, h) => { const s = Math.floor(Math.min(w, h) * 0.7); return { width: s, height: s }; } },
-        texto => procesar(texto),
+        { facingMode: 'environment' },
+        { fps: 25, qrbox: (w, h) => { const s = Math.floor(Math.min(w, h) * 0.8); return { width: s, height: s }; },
+          disableFlip: true },
+        alEscanear,
         () => {}
       );
     } catch (e) {
       $('btnCamara').classList.remove('oculto');
-      alert('No se pudo abrir la cámara. Revisa los permisos del navegador.\n' + e);
     }
   }
 
-  function pausar() { try { scanner?.pause(true); } catch (_) {} }
-  function reanudar() { try { scanner?.resume(); } catch (_) {} }
-
-  async function cambiarCamara() {
-    if (!scanner || camaras.length < 2) return;
-    await scanner.stop();
-    camIdx = (camIdx + 1) % camaras.length;
-    iniciarCamara();
+  /* ============ Modo ingreso / salida ============ */
+  function setModo(m) {
+    modo = m;
+    localStorage.setItem('grad_modo', m);
+    $('btnIn').classList.toggle('activo', m === 'in');
+    $('btnOut').classList.toggle('activo', m === 'out');
+    ultimo = { code: '', t: 0 };
   }
+  $('btnIn').addEventListener('click', () => setModo('in'));
+  $('btnOut').addEventListener('click', () => setModo('out'));
+  setModo(modo);
 
-  /* ================= LOGIN ================= */
+  /* ============ Login ============ */
   function cerrarSesion(msg) {
     pin = '';
     localStorage.removeItem('grad_pin');
@@ -173,44 +208,45 @@
   $('formLogin').addEventListener('submit', async e => {
     e.preventDefault();
     pin = $('inputPin').value.trim();
-    $('loginError').textContent = 'Verificando…';
+    $('loginError').textContent = 'Cargando invitados…';
     try {
-      const r = await api({ action: 'stats' });
+      const r = await api({ action: 'all' });
       if (!r.ok) throw new Error(r.error);
       localStorage.setItem('grad_pin', pin);
+      estados = new Map(r.codigos);
+      guardar();
+      pintarBarra();
       $('login').classList.add('oculto');
       $('loginError').textContent = '';
-      pintarStats(r.stats);
-      setConexion(true);
       iniciarCamara();
     } catch (err) {
       $('loginError').textContent = err.message || 'Error de conexión';
     }
   });
 
-  /* ================= EVENTOS ================= */
-  $('btnCamara').addEventListener('click', iniciarCamara);
-  $('btnCambiarCam').addEventListener('click', cambiarCamara);
-  $('btnSalir').addEventListener('click', () => cerrarSesion());
-  $('formManual').addEventListener('submit', e => {
-    e.preventDefault();
-    const v = $('inputCodigo').value;
-    $('inputCodigo').value = '';
-    ultimo = { code: '', t: 0 };   // permitir ingreso manual aunque se repita
-    procesar(v);
+  // Cerrar sesión: mantener presionada la barra 2 segundos
+  let tPress;
+  $('total').parentElement.addEventListener('pointerdown', () => {
+    tPress = setTimeout(() => { if (confirm('¿Cerrar sesión?')) cerrarSesion(); }, 2000);
   });
+  ['pointerup', 'pointerleave'].forEach(ev => $('total').parentElement.addEventListener(ev, () => clearTimeout(tPress)));
 
-  // Mantener pantalla encendida (si el navegador lo permite)
-  async function wakeLock() { try { await navigator.wakeLock?.request('screen'); } catch (_) {} }
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) { wakeLock(); refrescarStats(); } });
-  wakeLock();
+  $('btnCamara').addEventListener('click', iniciarCamara);
 
-  /* ================= INICIO ================= */
+  // Pantalla siempre encendida
+  const wake = async () => { try { await navigator.wakeLock?.request('screen'); } catch (_) {} };
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { wake(); sincronizar(); } });
+  wake();
+
+  /* ============ Inicio ============ */
+  pintarBarra();
   if (!pin) {
     $('login').classList.remove('oculto');
   } else {
-    refrescarStats();
-    // iniciar cámara requiere gesto del usuario en algunos navegadores (iOS): queda el botón visible
+    iniciarCamara();
+    enviarCola();
+    sincronizar();
   }
-  setInterval(() => { if (pin && !ocupado) refrescarStats(); }, (CFG.REFRESCO_SEG || 15) * 1000);
+  setInterval(sincronizar, (CFG.REFRESCO_SEG || 10) * 1000);
+  setInterval(enviarCola, 5000);
 })();
