@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111827">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>Control de Invitaciones</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- BARRA DE ESTADO -->
+  <header class="barra">
+    <div class="contador">
+      <span class="label">Presentes</span>
+      <span class="numero"><b id="presentes">–</b><span class="sep">/</span><span id="total">–</span></span>
+    </div>
+    <div class="detalle">
+      <span>🚪 Salieron: <b id="salieron">–</b></span>
+      <span>⏳ Pendientes: <b id="pendientes">–</b></span>
+      <span id="conexion" class="punto" title="Conexión"></span>
+    </div>
+    <div class="progreso"><div id="barraProgreso"></div></div>
+  </header>
+
+  <main>
+    <h1 id="evento"></h1>
+
+    <!-- CÁMARA -->
+    <div class="camara-wrap">
+      <div id="lector"></div>
+      <button id="btnCamara" class="btn grande">📷 Activar cámara</button>
+    </div>
+
+    <!-- INGRESO MANUAL -->
+    <form id="formManual" class="manual" autocomplete="off">
+      <input id="inputCodigo" placeholder="Código manual (ej. GR-AB12...)" autocapitalize="characters">
+      <button class="btn" type="submit">Validar</button>
+    </form>
+
+    <!-- HISTORIAL -->
+    <section>
+      <h2>Últimos escaneos</h2>
+      <ul id="historial" class="historial"></ul>
+    </section>
+
+    <div class="pie">
+      <button id="btnCambiarCam" class="btn sec">🔄 Cambiar cámara</button>
+      <button id="btnSalir" class="btn sec">🔒 Cerrar sesión</button>
+    </div>
+  </main>
+
+  <!-- RESULTADO A PANTALLA COMPLETA -->
+  <div id="overlay" class="overlay oculto">
+    <div class="icono" id="ovIcono"></div>
+    <div class="titulo" id="ovTitulo"></div>
+    <div class="nombre" id="ovNombre"></div>
+    <div class="codigo" id="ovCodigo"></div>
+  </div>
+
+  <!-- LOGIN CON PIN -->
+  <div id="login" class="login oculto">
+    <form id="formLogin" class="tarjeta">
+      <h2>🎓 Encargado</h2>
+      <p>Ingresa el PIN para comenzar</p>
+      <input id="inputPin" type="password" inputmode="numeric" placeholder="PIN" required>
+      <button class="btn grande" type="submit">Entrar</button>
+      <p id="loginError" class="error"></p>
+    </form>
+  </div>
+
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "name": "Control de Invitaciones",
+  "short_name": "Invitaciones",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#111827",
+  "orientation": "any",
+  "icons": []
+}
